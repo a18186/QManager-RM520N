@@ -102,6 +102,31 @@ sms_locked() {
         exit "$_sms_rc"
     ) 9<"$LOCK_FILE"
 }
+# --- Locked Python UCS-2 sender wrapper --------------------------------------
+# Same /tmp/qmanager_at.lock flock as sms_locked, but invokes the custom
+# Python script that builds a proper UCS-2 PDU. Needed because sms_tool's
+# own encoder silently replaces non-GSM characters with '?', regardless of
+# the -c flag (which is USSD-only), locale, or GCONV_PATH.
+sms_python_locked() {
+    _py_err="/tmp/qmanager_sms_py_err.$$"
+    (
+        flock_wait 9 10 || exit 2
+        _py_out=$(/opt/bin/python3 /opt/bin/send_sms_ucs2.py "$1" "$2" 2>"$_py_err")
+        _py_rc=$?
+        if [ "$_py_rc" -eq 0 ]; then
+            printf '%s' "$_py_out"
+        else
+            _py_err_clean=$(cat "$_py_err" 2>/dev/null)
+            if [ -n "$_py_err_clean" ]; then
+                printf '%s' "$_py_err_clean"
+            else
+                printf '%s' "$_py_out"
+            fi
+        fi
+        rm -f "$_py_err"
+        exit "$_py_rc"
+    ) 9<"$LOCK_FILE"
+}
 
 # --- MCC to country calling code lookup --------------------------------------
 # Maps the SIM's MCC (first 3 digits of IMSI) to ITU-T calling code.
@@ -500,10 +525,21 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         # Normalize: strip +, replace leading 0 with country code
         PHONE=$(normalize_phone "$RAW_PHONE")
 
-        qlog_info "Sending SMS to $PHONE (raw: $RAW_PHONE)"
+                qlog_info "Sending SMS to $PHONE (raw: $RAW_PHONE)"
 
-        result=$(sms_locked send "$PHONE" "$MESSAGE")
-        sms_rc=$?
+        # Route non-ASCII (Cyrillic, emoji, etc.) through the Python UCS-2
+        # sender. sms_tool's own encoder silently replaces non-GSM chars with
+        # '?', and its -c flag is USSD-only, so we can't force UCS-2 with it.
+        # Pure-ASCII keeps the fast sms_tool path.
+        non_ascii=$(printf '%s' "$MESSAGE" | LC_ALL=C tr -d '\000-\177')
+        if [ -n "$non_ascii" ]; then
+            qlog_info "Non-ASCII detected — using Python UCS-2 sender"
+            result=$(sms_python_locked "$PHONE" "$MESSAGE")
+            sms_rc=$?
+        else
+            result=$(sms_locked send "$PHONE" "$MESSAGE")
+            sms_rc=$?
+        fi
 
         if [ "$sms_rc" -eq 2 ]; then
             qlog_error "SMS send: could not acquire lock"
